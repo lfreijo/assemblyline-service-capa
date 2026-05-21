@@ -56,8 +56,8 @@ class CAPA(ServiceBase):
             # Ruleset downloaded from https://github.com/mandiant/capa/tree/v9.3.1/sigs
             os.path.join(os.path.dirname(__file__), "sigs"),
             "--rules",
-            # Ruleset downloaded from https://github.com/mandiant/capa-rules/archive/refs/tags/v9.3.1.zip
-            os.path.join(os.path.dirname(__file__), "capa-rules-9.3.1"),
+            # Ruleset downloaded from https://github.com/mandiant/capa-rules/archive/refs/tags/v9.4.0.zip
+            os.path.join(os.path.dirname(__file__), "capa-rules-9.4.0"),
             "--format",
             "auto",
             "--backend",
