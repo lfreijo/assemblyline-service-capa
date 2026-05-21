@@ -1,6 +1,7 @@
 import argparse
 import os
 import string
+import traceback
 from collections import defaultdict
 
 import capa.engine
@@ -86,10 +87,13 @@ class CAPA(ServiceBase):
         except capa.main.ShouldExitError as e:
             return {"path": input_file, "status": "error", "error": str(e), "status_code": e.status_code}
         except Exception as e:
+            tb = traceback.format_exc()
+            self.log.error("capa analysis failed for %s: %s\n%s", input_file, e, tb)
             return {
                 "path": input_file,
                 "status": "error",
                 "error": f"unexpected error: {e}",
+                "traceback": tb,
             }
 
         meta = capa.loader.collect_metadata(argv, args.input_file, "auto", os_, [], extractor, capabilities)
