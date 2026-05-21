@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import string
 import traceback
@@ -19,6 +20,54 @@ from assemblyline_v4_service.common.result import (
 )
 from capa.render.default import find_subrule_matches
 from capa.render.utils import capability_rules
+
+
+def _patch_vivisect_pe_parsesections():
+    # vivisect's PE.parseSections calls len(sbytes) without first checking
+    # whether readAtOffset returned None for a truncated/malformed PE, so
+    # samples that should produce a clean CorruptPeFile instead surface as
+    # "TypeError: object of type 'NoneType' has no len()" deep in capa's
+    # extractor setup. Replace it with a version that treats None as a
+    # short read and raises CorruptPeFile, matching the function's own
+    # intent at the same line.
+    try:
+        import PE
+        import vstruct
+        import vivisect.exc as v_exc
+    except ImportError:
+        return
+
+    def parseSections(self):
+        self.sections = []
+        off = self.IMAGE_DOS_HEADER.e_lfanew + len(self.IMAGE_NT_HEADERS)
+        off -= len(self.IMAGE_NT_HEADERS.OptionalHeader.DataDirectory)
+        off += self.IMAGE_NT_HEADERS.OptionalHeader.NumberOfRvaAndSizes * len(
+            vstruct.getStructure("pe.IMAGE_DATA_DIRECTORY")
+        )
+
+        secsize = len(vstruct.getStructure("pe.IMAGE_SECTION_HEADER"))
+        hdrsize = secsize * self.IMAGE_NT_HEADERS.FileHeader.NumberOfSections
+        sbytes = self.readAtOffset(off, hdrsize)
+
+        if sbytes is None or len(sbytes) != hdrsize:
+            raise v_exc.CorruptPeFile("truncated section headers")
+
+        indx = off
+        while sbytes:
+            s = vstruct.getStructure("pe.IMAGE_SECTION_HEADER")
+            s.vsParse(sbytes[:secsize])
+            s.vsSetMeta("Offset", indx)
+            indx += secsize
+            self.sections.append(s)
+            sbytes = sbytes[secsize:]
+
+    PE.PE.parseSections = parseSections
+    logging.getLogger("assemblyline.service.capa").info(
+        "applied vivisect PE.parseSections None-safety patch"
+    )
+
+
+_patch_vivisect_pe_parsesections()
 
 
 def safely_get_param(request: ServiceRequest, param, default):
