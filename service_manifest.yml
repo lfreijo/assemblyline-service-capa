@@ -23,7 +23,15 @@ enabled: true
 privileged: true
 
 config:
+  # Skip files larger than this (bytes). Capa/vivisect cost scales poorly with size.
   max_file_size: 512000
+  # Soft address-space cap (MiB) for the per-file analysis subprocess. When unset,
+  # derived from the container cgroup limit (limit minus headroom) so a pathological
+  # sample fails soft inside the child instead of OOMKilling the pod.
+  # analysis_memory_mb: 12288
+  # Wall-clock timeout (seconds) for a single analysis subprocess. Keep below the
+  # service timeout so the parent can return a soft error instead of being preempted.
+  analysis_timeout: 240
 
 submission_params:
   - default: "default"

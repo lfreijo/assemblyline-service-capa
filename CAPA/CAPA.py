@@ -1,9 +1,13 @@
 import argparse
 import logging
+import multiprocessing as mp
 import os
 import string
+import struct
+import sys
 import traceback
 from collections import defaultdict
+from queue import Empty
 
 import capa.engine
 import capa.main
@@ -20,6 +24,16 @@ from assemblyline_v4_service.common.result import (
 )
 from capa.render.default import find_subrule_matches
 from capa.render.utils import capability_rules
+
+LOG = logging.getLogger("assemblyline.service.capa")
+
+# Defaults used when service config does not override them.
+DEFAULT_MAX_FILE_SIZE = 512000
+DEFAULT_ANALYSIS_TIMEOUT = 240  # seconds; leave headroom under the 300s service timeout
+# When cgroup limit cannot be read (e.g. local dev), cap the analysis child at 3 GiB.
+DEFAULT_ANALYSIS_MEMORY_MB = 3072
+# Leave at least this much (or 25% of the cgroup limit) for the parent service process.
+ANALYSIS_MEMORY_HEADROOM_MB = 2048
 
 
 def _patch_vivisect_pe_parsesections():
@@ -62,9 +76,7 @@ def _patch_vivisect_pe_parsesections():
             sbytes = sbytes[secsize:]
 
     PE.PE.parseSections = parseSections
-    logging.getLogger("assemblyline.service.capa").info(
-        "applied vivisect PE.parseSections None-safety patch"
-    )
+    LOG.info("applied vivisect PE.parseSections None-safety patch")
 
 
 _patch_vivisect_pe_parsesections()
@@ -79,9 +91,226 @@ def safely_get_param(request: ServiceRequest, param, default):
     return param_value
 
 
+def _cgroup_memory_limit_mb():
+    """Return the container memory limit in MiB, or None if unlimited/unknown."""
+    candidates = (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    )
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read().strip()
+            if not raw or raw == "max":
+                return None
+            value = int(raw)
+            # Some hosts report a sentinel "unlimited" near 2^63.
+            if value <= 0 or value >= (1 << 62):
+                return None
+            return max(1, value // (1024 * 1024))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def default_analysis_memory_mb():
+    """
+    Soft address-space cap for the per-file analysis subprocess.
+
+    Sized from the cgroup limit when available so a pathological sample
+    dies inside the child (soft error) instead of OOMKilling the pod and
+    preempting the task. Leaves headroom for the parent service process.
+    """
+    limit = _cgroup_memory_limit_mb()
+    if not limit:
+        return DEFAULT_ANALYSIS_MEMORY_MB
+    headroom = max(ANALYSIS_MEMORY_HEADROOM_MB, limit // 4)
+    return max(1024, limit - headroom)
+
+
+def _apply_memory_limit_mb(memory_limit_mb):
+    """Best-effort RLIMIT_AS on the current process. No-op if unsupported."""
+    if not memory_limit_mb or memory_limit_mb <= 0:
+        return
+    try:
+        import resource
+
+        limit_bytes = int(memory_limit_mb) * 1024 * 1024
+        # RLIMIT_AS is not always effective on macOS; still attempt it.
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except Exception as exc:
+        LOG.debug("could not apply RLIMIT_AS(%s MiB): %s", memory_limit_mb, exc)
+
+
+def _is_expected_analysis_error(exc: BaseException) -> bool:
+    """
+    Malware samples are often corrupt or unsupported; these failures are
+    normal outcomes, not service bugs.
+    """
+    if isinstance(exc, (struct.error, AssertionError, MemoryError)):
+        return True
+    if isinstance(exc, capa.main.ShouldExitError):
+        return True
+
+    name = type(exc).__name__
+    if name in {"CorruptPeFile", "InvalidFormatError", "UnsupportedFormatError"}:
+        return True
+
+    msg = str(exc).lower()
+    expected_fragments = (
+        "corrupt",
+        "truncated",
+        "unpack requires",
+        "nonetype",
+        "not support",
+        "unsupported",
+        "invalid pe",
+        "invalid clr",
+        "invalid format",
+        "no matching",
+        "does not appear",
+    )
+    return any(fragment in msg for fragment in expected_fragments)
+
+
+def _error_result(input_file, error, *, expected=False, status_code=None, tb=None):
+    result = {
+        "path": input_file,
+        "status": "error",
+        "error": error,
+        "expected": expected,
+    }
+    if status_code is not None:
+        result["status_code"] = status_code
+    if tb is not None:
+        result["traceback"] = tb
+    return result
+
+
+def _run_capa_analysis(input_file, argv):
+    """
+    Pure capa analysis (no ServiceRequest). Safe to run in a child process.
+
+    Returns a pickle-friendly dict consumed by the parent to build Result sections.
+    """
+    parser = argparse.ArgumentParser(description="detect capabilities in programs.")
+    capa.main.install_common_args(
+        parser, wanted={"rules", "signatures", "format", "os", "backend", "input_file"}
+    )
+    full_argv = list(argv) + [input_file]
+    args = parser.parse_args(args=full_argv)
+
+    try:
+        capa.main.handle_common_args(args)
+        capa.main.ensure_input_exists_from_cli(args)
+        input_format = capa.main.get_input_format_from_cli(args)
+        rules = capa.main.get_rules_from_cli(args)
+        backend = capa.main.get_backend_from_cli(args, input_format)
+        sample_path = capa.main.get_sample_path_from_cli(args, backend)
+        if sample_path is None:
+            os_ = "unknown"
+        else:
+            os_ = capa.loader.get_os(sample_path)
+        extractor = capa.main.get_extractor_from_cli(args, input_format, backend)
+        capabilities = capa.capabilities.common.find_capabilities(
+            rules, extractor, disable_progress=True
+        )
+    except capa.main.ShouldExitError as e:
+        return _error_result(
+            input_file, str(e), expected=True, status_code=e.status_code
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        expected = _is_expected_analysis_error(e)
+        return _error_result(
+            input_file,
+            str(e) if expected else f"unexpected error: {e}",
+            expected=expected,
+            tb=tb,
+        )
+
+    meta = capa.loader.collect_metadata(
+        full_argv, args.input_file, "auto", os_, [], extractor, capabilities
+    )
+    meta.analysis.layout = capa.loader.compute_layout(rules, extractor, capabilities.matches)
+
+    file_limitations = []
+    file_limitation_rules = [
+        r
+        for r in rules.rules.values()
+        if r.meta.get("namespace", "").startswith("internal/limitation")
+    ]
+    for file_limitation_rule in file_limitation_rules:
+        if file_limitation_rule.name not in capabilities.matches:
+            continue
+        file_limitations.append(
+            {
+                "name": file_limitation_rule.name,
+                "description": file_limitation_rule.meta.get("description", "") or "",
+            }
+        )
+        break
+
+    doc = rd.ResultDocument.from_capa(meta, rules, capabilities.matches)
+
+    return {
+        "path": input_file,
+        "status": "ok",
+        "ok": doc.model_dump(),
+        # rule names for the simple renderer (avoids pickling capa internals)
+        "simple_matches": list(capabilities.matches.keys()),
+        "file_limitations": file_limitations,
+    }
+
+
+def _analysis_process_main(input_file, argv, result_queue, memory_limit_mb):
+    """Child-process entrypoint: optional RLIMIT_AS, then capa analysis."""
+    # Re-apply in the child (spawn starts a fresh interpreter; fork already has
+    # the patch, re-applying is harmless).
+    _patch_vivisect_pe_parsesections()
+    _apply_memory_limit_mb(memory_limit_mb)
+    try:
+        result_queue.put(_run_capa_analysis(input_file, argv))
+    except Exception as e:
+        result_queue.put(
+            _error_result(
+                input_file,
+                f"unexpected error: {e}",
+                expected=_is_expected_analysis_error(e),
+                tb=traceback.format_exc(),
+            )
+        )
+
+
+def _exit_code_is_memory_kill(exitcode):
+    # Negative: signal number on POSIX (-9 SIGKILL, -11 SIGSEGV, -6 SIGABRT).
+    # 137: 128 + SIGKILL when shells report it as an unsigned status.
+    if exitcode is None:
+        return False
+    if exitcode in (-9, -11, -6, 137, 139, 134):
+        return True
+    return False
+
+
+def _make_mp_context():
+    """
+    Prefer forkserver on Linux: one-time import in the server process, then
+    each analysis is a fork of that baseline (no accumulated vivisect state,
+    cheaper than spawn-per-file). Fall back to spawn elsewhere.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            return mp.get_context("forkserver")
+        except ValueError:
+            pass
+    return mp.get_context("spawn")
+
+
 class CAPA(ServiceBase):
     def __init__(self, config=None):
         super().__init__(config)
+        self.argv = []
+        self._mp_ctx = _make_mp_context()
 
     def start(self):
         # capa does not declare a __str__ or a __repr__ for that special object, so without the following, we get
@@ -94,10 +323,6 @@ class CAPA(ServiceBase):
             f"children: {self.children}, "
             f"locations: {self.locations}"
             ")"
-        )
-        self.parser = argparse.ArgumentParser(description="detect capabilities in programs.")
-        capa.main.install_common_args(
-            self.parser, wanted={"rules", "signatures", "format", "os", "backend", "input_file"}
         )
         self.argv = [
             "--quiet",
@@ -114,63 +339,97 @@ class CAPA(ServiceBase):
             "--os",
             "auto",
         ]
+        analysis_mb = self.config.get("analysis_memory_mb")
+        if analysis_mb is None:
+            analysis_mb = default_analysis_memory_mb()
+        self.log.info(
+            "CAPA ready (capa %s, analysis_memory_mb=%s, analysis_timeout=%s)",
+            capa.version.__version__,
+            analysis_mb,
+            self.config.get("analysis_timeout", DEFAULT_ANALYSIS_TIMEOUT),
+        )
+
+    def _analysis_memory_mb(self):
+        configured = self.config.get("analysis_memory_mb")
+        if configured is None:
+            return default_analysis_memory_mb()
+        return int(configured)
+
+    def _analysis_timeout(self):
+        return int(self.config.get("analysis_timeout", DEFAULT_ANALYSIS_TIMEOUT))
 
     def get_capa_results(self, request: ServiceRequest, input_file):
-        # Mostly taken from https://github.com/mandiant/capa/blob/v7.0.1/scripts/bulk-process.py
-        argv = self.argv + [input_file]
-        args = self.parser.parse_args(args=argv)
+        """
+        Run capa in an isolated subprocess so vivisect/capa memory is released
+        after every file and a pathological sample cannot OOMKill the pod.
+        """
+        memory_limit_mb = self._analysis_memory_mb()
+        timeout = self._analysis_timeout()
+        result_queue = self._mp_ctx.Queue()
+        proc = self._mp_ctx.Process(
+            target=_analysis_process_main,
+            args=(input_file, self.argv, result_queue, memory_limit_mb),
+            name="capa-analysis",
+        )
+        proc.start()
+        proc.join(timeout=timeout)
+
+        if proc.is_alive():
+            self.log.warning(
+                "capa analysis timed out after %ss for %s; killing child",
+                timeout,
+                input_file,
+            )
+            proc.kill()
+            proc.join(5)
+            return _error_result(
+                input_file,
+                f"analysis timed out after {timeout}s",
+                expected=True,
+            )
+
+        if proc.exitcode not in (0, None):
+            if _exit_code_is_memory_kill(proc.exitcode):
+                return _error_result(
+                    input_file,
+                    f"analysis exceeded memory limit (~{memory_limit_mb} MiB)",
+                    expected=True,
+                )
+            # Child may still have put a structured result before dying.
+            try:
+                return result_queue.get_nowait()
+            except Empty:
+                return _error_result(
+                    input_file,
+                    f"analysis process exited with code {proc.exitcode}",
+                    expected=False,
+                )
 
         try:
-            capa.main.handle_common_args(args)
-            capa.main.ensure_input_exists_from_cli(args)
-            input_format = capa.main.get_input_format_from_cli(args)
-            rules = capa.main.get_rules_from_cli(args)
-            backend = capa.main.get_backend_from_cli(args, input_format)
-            sample_path = capa.main.get_sample_path_from_cli(args, backend)
-            if sample_path is None:
-                os_ = "unknown"
-            else:
-                os_ = capa.loader.get_os(sample_path)
-            extractor = capa.main.get_extractor_from_cli(args, input_format, backend)
-            capabilities = capa.capabilities.common.find_capabilities(rules, extractor, disable_progress=True)
-        except capa.main.ShouldExitError as e:
-            return {"path": input_file, "status": "error", "error": str(e), "status_code": e.status_code}
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.log.error("capa analysis failed for %s: %s\n%s", input_file, e, tb)
-            return {
-                "path": input_file,
-                "status": "error",
-                "error": f"unexpected error: {e}",
-                "traceback": tb,
-            }
+            return result_queue.get_nowait()
+        except Empty:
+            return _error_result(
+                input_file,
+                "analysis process produced no result",
+                expected=False,
+            )
 
-        meta = capa.loader.collect_metadata(argv, args.input_file, "auto", os_, [], extractor, capabilities)
-        meta.analysis.layout = capa.loader.compute_layout(rules, extractor, capabilities.matches)
-
-        file_limitation_rules = list(
-            filter(lambda r: r.meta.get("namespace", "").startswith("internal/limitation"), rules.rules.values())
-        )
-        for file_limitation_rule in file_limitation_rules:
-            if file_limitation_rule.name not in capabilities.matches:
-                continue
-
-            res = ResultSection(f"File Limitation - {file_limitation_rule.name}")
-            res.add_line(file_limitation_rule.meta.get("description", ""))
+    def _apply_ok_result(self, request, result):
+        for limitation in result.get("file_limitations") or []:
+            res = ResultSection(f"File Limitation - {limitation['name']}")
+            res.add_line(limitation.get("description", ""))
             request.result.add_section(res)
-            break
-
-        doc = rd.ResultDocument.from_capa(meta, rules, capabilities.matches)
 
         renderer = safely_get_param(request, "renderer", "default")
         if renderer == "simple":
-            self.simple_view(request, capabilities)
-        elif renderer == "verbose":
+            self.simple_view_from_names(request, result.get("simple_matches") or [])
+            return
+
+        doc = rd.ResultDocument.model_validate(result["ok"])
+        if renderer == "verbose":
             self.render_rules(request, doc)
         else:
             self.default_view(request, doc)
-
-        return {"path": input_file, "status": "ok", "ok": doc.model_dump()}
 
     def default_view(self, request, doc: rd.ResultDocument):
         tactics = defaultdict(set)
@@ -253,18 +512,22 @@ class CAPA(ServiceBase):
         if added:
             request.result.add_section(res)
 
-    def simple_view(self, request, capabilities):
+    def simple_view_from_names(self, request, match_names):
         def remove_hash_ending(rule_name):
             if len(rule_name) > 33 and rule_name[-33] == "/" and all(c in string.hexdigits for c in rule_name[-32:]):
                 return remove_hash_ending(rule_name[:-33])
             return rule_name
 
-        capa_graph_data = list(set([remove_hash_ending(x) for x in capabilities.matches.keys()]))
+        capa_graph_data = list({remove_hash_ending(x) for x in match_names})
 
         res = ResultSection("CAPA Information")
         res.add_lines(capa_graph_data)
 
         request.result.add_section(res)
+
+    def simple_view(self, request, capabilities):
+        # Kept for compatibility with anything that still passes a capa capabilities object.
+        self.simple_view_from_names(request, list(capabilities.matches.keys()))
 
     def render_rules(self, request, doc: rd.ResultDocument):
         # See https://github.com/mandiant/capa/blob/v6.1.0/capa/render/vverbose.py#L281
@@ -320,19 +583,28 @@ class CAPA(ServiceBase):
     def execute(self, request):
         request.result = Result()
 
-        if request.file_size > self.config.get("max_file_size", 512000):
+        if request.file_size > self.config.get("max_file_size", DEFAULT_MAX_FILE_SIZE):
             return
 
         request.set_service_context(f"CAPA {self.get_tool_version()}")
 
         result = self.get_capa_results(request, request.file_path)
-        if result["status"] == "error":
-            self.log.error(result["error"])
-        elif result["status"] == "ok":
-            pass
-            # doc = rd.ResultDocument.model_validate(result["ok"]).model_dump_json(exclude_none=True)
+        status = result.get("status")
+        if status == "error":
+            expected = result.get("expected", False)
+            message = result.get("error") or "unknown capa error"
+            if expected:
+                self.log.warning("%s", message)
+            else:
+                tb = result.get("traceback")
+                if tb:
+                    self.log.error("%s\n%s", message, tb)
+                else:
+                    self.log.error("%s", message)
+        elif status == "ok":
+            self._apply_ok_result(request, result)
         else:
-            raise ValueError(f"unexpected status: {result['status']}")
+            raise ValueError(f"unexpected status: {status}")
 
     def get_tool_version(self):
         return capa.version.__version__
