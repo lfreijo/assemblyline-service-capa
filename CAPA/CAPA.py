@@ -1,10 +1,10 @@
 import argparse
+import errno
 import logging
 import multiprocessing as mp
 import os
 import string
 import struct
-import sys
 import traceback
 from collections import defaultdict
 from queue import Empty
@@ -292,17 +292,51 @@ def _exit_code_is_memory_kill(exitcode):
     return False
 
 
+# Process.start() failures that mean the multiprocessing infrastructure died
+# (typically a forkserver whose Unix socket vanished after a SIGKILL'd child).
+_MP_START_ERRNOS = {
+    errno.ENOENT,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.ECONNABORTED,
+    errno.EPIPE,
+}
+
+
+def _is_mp_start_failure(exc: BaseException) -> bool:
+    if isinstance(exc, (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, BrokenPipeError)):
+        return True
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) in _MP_START_ERRNOS
+
+
+def _close_mp_resources(proc, result_queue):
+    if result_queue is not None:
+        try:
+            result_queue.close()
+        except Exception:
+            pass
+        try:
+            result_queue.cancel_join_thread()
+        except Exception:
+            pass
+    if proc is not None:
+        try:
+            proc.close()
+        except Exception:
+            pass
+
+
 def _make_mp_context():
     """
-    Prefer forkserver on Linux: one-time import in the server process, then
-    each analysis is a fork of that baseline (no accumulated vivisect state,
-    cheaper than spawn-per-file). Fall back to spawn elsewhere.
+    Always spawn.
+
+    forkserver is cheaper if you preload capa/vivisect once, but it keeps a
+    long-lived server that imports __main__ (the AL service + capa). We
+    SIGKILL analysis children on timeout and RLIMIT_AS, and those kills (or
+    a cgroup OOM) take the forkserver down. After that every Process.start()
+    fails with FileNotFoundError until the pod restarts — the prod failure
+    mode on cluster h.
     """
-    if sys.platform.startswith("linux"):
-        try:
-            return mp.get_context("forkserver")
-        except ValueError:
-            pass
     return mp.get_context("spawn")
 
 
@@ -358,6 +392,10 @@ class CAPA(ServiceBase):
     def _analysis_timeout(self):
         return int(self.config.get("analysis_timeout", DEFAULT_ANALYSIS_TIMEOUT))
 
+    def _reset_mp_context(self):
+        """Drop a dead spawn/forkserver context so the next start() is clean."""
+        self._mp_ctx = _make_mp_context()
+
     def get_capa_results(self, request: ServiceRequest, input_file):
         """
         Run capa in an isolated subprocess so vivisect/capa memory is released
@@ -365,54 +403,91 @@ class CAPA(ServiceBase):
         """
         memory_limit_mb = self._analysis_memory_mb()
         timeout = self._analysis_timeout()
-        result_queue = self._mp_ctx.Queue()
-        proc = self._mp_ctx.Process(
-            target=_analysis_process_main,
-            args=(input_file, self.argv, result_queue, memory_limit_mb),
-            name="capa-analysis",
-        )
-        proc.start()
-        proc.join(timeout=timeout)
+        last_start_error = None
 
-        if proc.is_alive():
-            self.log.warning(
-                "capa analysis timed out after %ss for %s; killing child",
-                timeout,
-                input_file,
-            )
-            proc.kill()
-            proc.join(5)
+        # One retry after resetting the mp context: a dead forkserver (or a
+        # similarly broken spawn helper) fails start() with FileNotFoundError
+        # on every subsequent file until we replace it.
+        for attempt in range(2):
+            result_queue = None
+            proc = None
+            try:
+                result_queue = self._mp_ctx.Queue()
+                proc = self._mp_ctx.Process(
+                    target=_analysis_process_main,
+                    args=(input_file, self.argv, result_queue, memory_limit_mb),
+                    name="capa-analysis",
+                )
+                proc.start()
+            except Exception as e:
+                _close_mp_resources(proc, result_queue)
+                if _is_mp_start_failure(e) and attempt == 0:
+                    last_start_error = e
+                    self.log.warning(
+                        "capa child start failed (%s); resetting multiprocessing context and retrying",
+                        e,
+                    )
+                    self._reset_mp_context()
+                    continue
+                if _is_mp_start_failure(e):
+                    return _error_result(
+                        input_file,
+                        f"failed to start analysis process: {e}",
+                        expected=False,
+                    )
+                raise
+            break
+        else:
             return _error_result(
                 input_file,
-                f"analysis timed out after {timeout}s",
-                expected=True,
+                f"failed to start analysis process: {last_start_error}",
+                expected=False,
             )
 
-        if proc.exitcode not in (0, None):
-            if _exit_code_is_memory_kill(proc.exitcode):
+        try:
+            proc.join(timeout=timeout)
+
+            if proc.is_alive():
+                self.log.warning(
+                    "capa analysis timed out after %ss for %s; killing child",
+                    timeout,
+                    input_file,
+                )
+                proc.kill()
+                proc.join(5)
                 return _error_result(
                     input_file,
-                    f"analysis exceeded memory limit (~{memory_limit_mb} MiB)",
+                    f"analysis timed out after {timeout}s",
                     expected=True,
                 )
-            # Child may still have put a structured result before dying.
+
+            if proc.exitcode not in (0, None):
+                if _exit_code_is_memory_kill(proc.exitcode):
+                    return _error_result(
+                        input_file,
+                        f"analysis exceeded memory limit (~{memory_limit_mb} MiB)",
+                        expected=True,
+                    )
+                # Child may still have put a structured result before dying.
+                try:
+                    return result_queue.get_nowait()
+                except Empty:
+                    return _error_result(
+                        input_file,
+                        f"analysis process exited with code {proc.exitcode}",
+                        expected=False,
+                    )
+
             try:
                 return result_queue.get_nowait()
             except Empty:
                 return _error_result(
                     input_file,
-                    f"analysis process exited with code {proc.exitcode}",
+                    "analysis process produced no result",
                     expected=False,
                 )
-
-        try:
-            return result_queue.get_nowait()
-        except Empty:
-            return _error_result(
-                input_file,
-                "analysis process produced no result",
-                expected=False,
-            )
+        finally:
+            _close_mp_resources(proc, result_queue)
 
     def _apply_ok_result(self, request, result):
         for limitation in result.get("file_limitations") or []:

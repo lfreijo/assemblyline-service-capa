@@ -1,15 +1,57 @@
 """Unit tests for CAPA analysis isolation helpers (no sample binaries required)."""
 
 import struct
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Import helpers without constructing the full ServiceBase service when possible.
+# Isolation tests only need CAPA.py helpers. Stub the AL/capa packages when they
+# are not installed so these unit tests can run outside the service image.
+try:
+    import assemblyline_v4_service.common.base  # noqa: F401
+    import capa.engine  # noqa: F401
+except ImportError:
+    def _stub(name, **attrs):
+        mod = sys.modules.get(name) or types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        sys.modules[name] = mod
+        parent, _, child = name.rpartition(".")
+        if parent:
+            setattr(sys.modules[parent], child, mod)
+        return mod
+
+    _stub("assemblyline_v4_service")
+    _stub("assemblyline_v4_service.common")
+    _stub("assemblyline_v4_service.common.base", ServiceBase=type("ServiceBase", (), {}))
+    _stub("assemblyline_v4_service.common.request", ServiceRequest=type("ServiceRequest", (), {}))
+    _stub(
+        "assemblyline_v4_service.common.result",
+        Result=type("Result", (), {}),
+        ResultOrderedKeyValueSection=type("ResultOrderedKeyValueSection", (), {}),
+        ResultSection=type("ResultSection", (), {}),
+        ResultTableSection=type("ResultTableSection", (), {}),
+        TableRow=type("TableRow", (), {}),
+    )
+    capa_mod = _stub("capa")
+    _stub("capa.engine", Result=type("Result", (), {}))
+    _stub("capa.main", ShouldExitError=type("ShouldExitError", (Exception,), {}))
+    _stub("capa.version", __version__="test")
+    rd = _stub("capa.render")
+    _stub("capa.render.result_document", ResultDocument=type("ResultDocument", (), {}))
+    _stub("capa.render.default", find_subrule_matches=lambda *a, **k: set())
+    _stub("capa.render.utils", capability_rules=lambda *a, **k: [])
+    capa_mod.engine = sys.modules["capa.engine"]
+    capa_mod.main = sys.modules["capa.main"]
+    capa_mod.version = sys.modules["capa.version"]
+
 from CAPA.CAPA import (
     _error_result,
     _exit_code_is_memory_kill,
     _is_expected_analysis_error,
+    _is_mp_start_failure,
     default_analysis_memory_mb,
 )
 
@@ -111,6 +153,9 @@ class TestGetCapaResultsIsolation:
                 self._alive = False
                 self.exitcode = -9
 
+            def close(self):
+                return None
+
         with patch.object(svc._mp_ctx, "Process", FakeProc):
             with patch.object(svc._mp_ctx, "Queue", return_value=MagicMock()):
                 result = svc.get_capa_results(MagicMock(), "/tmp/fake")
@@ -138,6 +183,9 @@ class TestGetCapaResultsIsolation:
             def kill(self):
                 return None
 
+            def close(self):
+                return None
+
         with patch.object(svc._mp_ctx, "Process", FakeProc):
             with patch.object(svc._mp_ctx, "Queue", return_value=MagicMock()):
                 result = svc.get_capa_results(MagicMock(), "/tmp/fake")
@@ -153,6 +201,12 @@ class TestGetCapaResultsIsolation:
         class FakeQueue:
             def get_nowait(self):
                 return payload
+
+            def close(self):
+                return None
+
+            def cancel_join_thread(self):
+                return None
 
         class FakeProc:
             def __init__(self, *a, **k):
@@ -170,8 +224,96 @@ class TestGetCapaResultsIsolation:
             def kill(self):
                 return None
 
+            def close(self):
+                return None
+
         with patch.object(svc._mp_ctx, "Process", FakeProc):
             with patch.object(svc._mp_ctx, "Queue", return_value=FakeQueue()):
                 result = svc.get_capa_results(MagicMock(), "/tmp/fake")
 
         assert result is payload
+
+    def test_start_filenotfound_retries_then_succeeds(self):
+        svc = self._service()
+        payload = {"path": "/tmp/fake", "status": "ok", "ok": {}, "simple_matches": [], "file_limitations": []}
+        starts = {"n": 0}
+
+        class FakeQueue:
+            def get_nowait(self):
+                return payload
+
+            def close(self):
+                return None
+
+            def cancel_join_thread(self):
+                return None
+
+        class FlakyProc:
+            def __init__(self, *a, **k):
+                self.exitcode = 0
+
+            def start(self):
+                starts["n"] += 1
+                if starts["n"] == 1:
+                    raise FileNotFoundError("[Errno 2] No such file or directory")
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return False
+
+            def kill(self):
+                return None
+
+            def close(self):
+                return None
+
+        with patch("CAPA.CAPA._make_mp_context", return_value=svc._mp_ctx):
+            with patch.object(svc._mp_ctx, "Process", FlakyProc):
+                with patch.object(svc._mp_ctx, "Queue", return_value=FakeQueue()):
+                    result = svc.get_capa_results(MagicMock(), "/tmp/fake")
+
+        assert result is payload
+        assert starts["n"] == 2
+        svc.log.warning.assert_called()
+
+    def test_start_filenotfound_twice_returns_error_not_raise(self):
+        svc = self._service()
+
+        class DeadProc:
+            def __init__(self, *a, **k):
+                self.exitcode = None
+
+            def start(self):
+                raise FileNotFoundError("[Errno 2] No such file or directory")
+
+            def close(self):
+                return None
+
+        with patch("CAPA.CAPA._make_mp_context", return_value=svc._mp_ctx):
+            with patch.object(svc._mp_ctx, "Process", DeadProc):
+                with patch.object(svc._mp_ctx, "Queue", return_value=MagicMock()):
+                    result = svc.get_capa_results(MagicMock(), "/tmp/fake")
+
+        assert result["status"] == "error"
+        assert result["expected"] is False
+        assert "failed to start analysis process" in result["error"]
+
+
+class TestMpContext:
+    def test_uses_spawn(self):
+        from CAPA.CAPA import _make_mp_context
+
+        assert _make_mp_context().get_start_method() == "spawn"
+
+
+class TestMpStartFailure:
+    def test_filenotfound(self):
+        assert _is_mp_start_failure(FileNotFoundError("no such file"))
+
+    def test_conn_refused(self):
+        assert _is_mp_start_failure(ConnectionRefusedError())
+
+    def test_generic_runtime_is_not(self):
+        assert not _is_mp_start_failure(RuntimeError("boom"))
